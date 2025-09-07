@@ -10,14 +10,20 @@ AI-Driven Public Health Chatbot (HealthAlert)
 - On-demand alert scan endpoint that classifies outbreaks and saves alerts to Mongo
 - Token-aware session trimming (defaults to 128k tokens) with optional summarization
 
-ENV (use .env or environment variables):
+New additions:
+- Public API key registration endpoint (/public/register)
+- Public chat endpoint (/public/chat) that external apps can call with X-API-KEY
+- Alert scanning respects published article dates; older pages (default > ALERT_MAX_AGE_DAYS) are excluded unless allow_old=true
+
+ENV:
 - MONGO_URI (default: mongodb://localhost:27017)
 - DB_NAME (default: health_alert)
 - OLLAMA_URL (default: http://localhost:11434)
 - OLLAMA_MODEL (default: gemma3:4b)
 - CHROMA_PERSIST_DIR (default: ./chromadb_persist)
 - SESSION_CONTEXT_MAX_TOKENS (default: 128000)
-- SUMMARIZE_OLD_MESSAGES (default: "false") -> set "true" to attempt summarization when trimming
+- SUMMARIZE_OLD_MESSAGES (default: "false")
+- ALERT_MAX_AGE_DAYS (default: 30)
 """
 
 import os
@@ -28,8 +34,9 @@ import traceback
 import asyncio
 import re
 from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone, timedelta
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -64,6 +71,12 @@ try:
 except Exception:
     tiktoken = None
 
+# optional date parsing
+try:
+    from dateutil import parser as dateutil_parser
+except Exception:
+    dateutil_parser = None
+
 load_dotenv()
 
 # ---------- Config ----------
@@ -74,6 +87,7 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:4b")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chromadb_persist")
 SESSION_CONTEXT_MAX_TOKENS = int(os.getenv("SESSION_CONTEXT_MAX_TOKENS", 128000))
 SUMMARIZE_OLD_MESSAGES = os.getenv("SUMMARIZE_OLD_MESSAGES", "false").lower() in ("1", "true", "yes")
+ALERT_MAX_AGE_DAYS = int(os.getenv("ALERT_MAX_AGE_DAYS", 30))
 
 # trusted domains for searching health news / advisories
 HEALTH_DOMAIN_WHITELIST = {
@@ -95,6 +109,7 @@ users_col = db["users"]
 sessions_col = db["sessions"]
 docs_meta_col = db["docs_meta"]
 alerts_col = db["alerts"]
+api_keys_col = db["api_keys"]
 
 # ---------- Embedding + Chroma init (with fallback) ----------
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
@@ -227,6 +242,17 @@ class DocIn(BaseModel):
     content: str
     source: Optional[str] = None
 
+# public API models
+class PublicRegister(BaseModel):
+    user_id: Optional[str] = None
+    name: Optional[str] = None
+
+class PublicMessage(BaseModel):
+    text: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    title: Optional[str] = None
+
 # ---------- Utilities ----------
 def is_trusted_domain(url: str) -> bool:
     try:
@@ -239,7 +265,98 @@ def is_trusted_domain(url: str) -> bool:
     except Exception:
         return False
 
+def _try_parse_date_string(s: str) -> Optional[float]:
+    if not s:
+        return None
+    s = s.strip()
+    # try dateutil if available
+    if dateutil_parser is not None:
+        try:
+            dt = dateutil_parser.parse(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            pass
+    # try iso format
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        pass
+    # look for YYYY-MM-DD-ish patterns
+    m = re.search(r'(\d{4}-\d{2}-\d{2})([ T]\d{2}:\d{2}:\d{2})?', s)
+    if m:
+        try:
+            dt = datetime.fromisoformat(m.group(0))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            pass
+    # fallback None
+    return None
+
+def extract_published_ts_from_soup(soup: BeautifulSoup) -> Optional[float]:
+    # check common meta tags
+    meta_props = [
+        ('meta', {'property': 'article:published_time'}),
+        ('meta', {'name': 'article:published_time'}),
+        ('meta', {'name': 'pubdate'}),
+        ('meta', {'name': 'publish-date'}),
+        ('meta', {'name': 'publication_date'}),
+        ('meta', {'name': 'date'}),
+        ('meta', {'property': 'og:published_time'}),
+        ('meta', {'property': 'og:updated_time'}),
+        ('meta', {'name': 'DC.Date'}),
+    ]
+    for tag_name, attrs in meta_props:
+        try:
+            t = soup.find(tag_name, attrs=attrs)
+            if t and t.get("content"):
+                ts = _try_parse_date_string(t.get("content"))
+                if ts:
+                    return ts
+        except Exception:
+            continue
+    # <time datetime="...">
+    try:
+        time_tag = soup.find("time")
+        if time_tag:
+            dt = time_tag.get("datetime") or time_tag.get_text()
+            ts = _try_parse_date_string(dt)
+            if ts:
+                return ts
+    except Exception:
+        pass
+    # other possible meta properties
+    try:
+        t = soup.find("meta", attrs={"property": "article:modified_time"})
+        if t and t.get("content"):
+            ts = _try_parse_date_string(t.get("content"))
+            if ts:
+                return ts
+    except Exception:
+        pass
+    # last-resort: find a date-like pattern near top of article
+    try:
+        body_text = soup.get_text()[:1000]
+        m = re.search(r'(\d{4}-\d{2}-\d{2})', body_text)
+        if m:
+            ts = _try_parse_date_string(m.group(1))
+            if ts:
+                return ts
+    except Exception:
+        pass
+    return None
+
 def web_search_health(query: str, num: int = 6):
+    """
+    Returns list of dicts: {"url": url, "snippet": snippet, "published_ts": <float|None>, "published_iso": <str|None>}
+    Only returns trusted domain results (HEALTH_DOMAIN_WHITELIST).
+    """
     results = []
     if google_search is None:
         return results
@@ -247,6 +364,8 @@ def web_search_health(query: str, num: int = 6):
         urls = list(google_search(query, num_results=num))
     except Exception:
         urls = []
+    now_ts = time.time()
+    cutoff_seconds = ALERT_MAX_AGE_DAYS * 86400
     for url in urls:
         if not is_trusted_domain(url):
             continue
@@ -260,7 +379,15 @@ def web_search_health(query: str, num: int = 6):
             if not desc:
                 p = soup.find("p")
                 desc = p.get_text().strip()[:800] if p else ""
-            results.append({"url": url, "snippet": desc})
+            published_ts = extract_published_ts_from_soup(soup)
+            published_iso = None
+            if published_ts:
+                try:
+                    published_iso = datetime.fromtimestamp(published_ts, tz=timezone.utc).isoformat()
+                except Exception:
+                    published_iso = None
+            # by default exclude pages older than ALERT_MAX_AGE_DAYS (unless caller overrides)
+            results.append({"url": url, "snippet": desc, "published_ts": published_ts, "published_iso": published_iso})
         except Exception:
             continue
     return results
@@ -285,7 +412,8 @@ def build_alert_prompt(region: str, web_results: list, retrieved_docs: list, now
     if web_results:
         parts.append("WEB_FINDINGS:")
         for i, w in enumerate(web_results, start=1):
-            parts.append(f"\n[{i}] {w.get('url')}\n{w.get('snippet')}\n")
+            pub = w.get("published_iso") or "unknown"
+            parts.append(f"\n[{i}] {w.get('url')}\nPublished: {pub}\n{w.get('snippet')}\n")
     if retrieved_docs:
         parts.append("\nLOCAL_DOCS:")
         for i, d in enumerate(retrieved_docs, start=1):
@@ -308,16 +436,33 @@ def build_alert_prompt(region: str, web_results: list, retrieved_docs: list, now
     )
     return "\n".join(parts)
 
-async def scan_region_for_alert(region: str = "India", query: Optional[str] = None, k_docs: int = 4):
+async def scan_region_for_alert(region: str = "India", query: Optional[str] = None, k_docs: int = 4, allow_old: bool = False):
     """Run a web + local-doc scan for the given region, call LLM to classify and store the alert.
 
-    Returns the alert document (including inserted _id).
+    Now respects article publish timestamps and by default excludes results older than ALERT_MAX_AGE_DAYS.
+    Set allow_old=True to include older pages (not recommended unless explicitly desired).
     """
     now_ts = time.time()
     q = query or f"outbreak OR surge OR cluster OR 'disease outbreak' site:gov.in OR site:who.int {region}"
-    web_results = web_search_health(q, num=8)
+    web_results_raw = web_search_health(q, num=8)
+    # filter by publish date
+    filtered_web_results = []
+    cutoff_seconds = ALERT_MAX_AGE_DAYS * 86400
+    filtered_out_count = 0
+    for w in web_results_raw:
+        pub_ts = w.get("published_ts")
+        if pub_ts is None:
+            # unknown publish date: include but mark as unknown
+            filtered_web_results.append(w)
+            continue
+        age = now_ts - float(pub_ts)
+        if age <= cutoff_seconds or allow_old:
+            filtered_web_results.append(w)
+        else:
+            filtered_out_count += 1
+
     retrieved = await retrieve_similar(q, k=k_docs)
-    prompt = build_alert_prompt(region, web_results, retrieved, now_ts)
+    prompt = build_alert_prompt(region, filtered_web_results, retrieved, now_ts)
     try:
         raw = call_ollama_generate(prompt, timeout=60)
     except Exception as e:
@@ -337,7 +482,8 @@ async def scan_region_for_alert(region: str = "India", query: Optional[str] = No
     alert_doc = {
         "region": region,
         "query": q,
-        "web_results": web_results,
+        "web_results": filtered_web_results,
+        "filtered_out_count": filtered_out_count,
         "retrieved_docs": [{"id": r.get("id"), "meta": r.get("meta")} for r in retrieved],
         "llm_raw": raw,
         "alert": parsed,
@@ -538,15 +684,111 @@ async def post_message(session_id: str, payload: MessageIn):
     # Optional: memory extraction could be added here (omitted for brevity)
     return {"assistant": assistant_text, "retrieved": retrieved, "web_results": web_results}
 
+# ---------- Public API key management & public chat ----------
+async def _get_api_key_doc(api_key: str) -> Optional[Dict[str, Any]]:
+    if not api_key:
+        return None
+    doc = await api_keys_col.find_one({"_key": api_key})
+    return doc
+
+@app.post("/public/register", summary="Create a public API key (simple)")
+async def public_register(payload: PublicRegister):
+    # Create a simple API key tied to optional user_id
+    api_key = uuid.uuid4().hex
+    doc = {
+        "_id": str(uuid.uuid4()),
+        "_key": api_key,
+        "user_id": payload.user_id,
+        "name": payload.name,
+        "active": True,
+        "created_at": time.time(),
+    }
+    await api_keys_col.insert_one(doc)
+    # return only the key (store in DB so you can revoke later)
+    return {"status": "ok", "api_key": api_key, "note": "Store this key securely; it's shown only once here."}
+
+@app.post("/public/chat", summary="Public chat endpoint — use X-API-KEY header")
+async def public_chat(payload: PublicMessage, x_api_key: Optional[str] = Header(None)):
+    api_key = x_api_key
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing X-API-KEY header")
+    key_doc = await _get_api_key_doc(api_key)
+    if not key_doc or not key_doc.get("active", False):
+        raise HTTPException(status_code=401, detail="Invalid or inactive API key")
+
+    # Allow reuse of existing sessions; if not provided create a new session for this API client
+    session_id = payload.session_id
+    if session_id:
+        sess = await sessions_col.find_one({"_id": session_id})
+        if not sess:
+            # create new session if provided id not found
+            session_id = None
+
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        title = payload.title or f"PublicSession-{session_id[:8]}"
+        doc = {"_id": session_id, "user_id": payload.user_id or key_doc.get("user_id") or "public_user", "title": title, "meta": {"public_key_id": key_doc.get("_id")}, "messages": [], "created_at": time.time()}
+        await sessions_col.insert_one(doc)
+
+    # Insert user message into session
+    user_msg = {"role": "user", "user_id": payload.user_id or key_doc.get("user_id") or "public_user", "text": payload.text, "ts": time.time()}
+    await sessions_col.update_one({"_id": session_id}, {"$push": {"messages": user_msg}})
+
+    # Trim session
+    await trim_session_messages(session_id)
+
+    # RAG + web
+    retrieved = await retrieve_similar(payload.text, k=4)
+    web_results = web_search_health(payload.text, num=3)
+
+    # Build prompt similar to internal flow
+    user = await users_col.find_one({"_id": payload.user_id}) or {}
+    user_memory_text = json.dumps(user.get("memory", {}), indent=2) if user.get("memory") else ""
+    session = await sessions_col.find_one({"_id": session_id})
+    session_messages = session.get("messages", []) if session else []
+
+    system_instructions = (
+        "You are a public-health assistant helping rural and semi-urban citizens with preventive healthcare, disease symptoms, and vaccination schedules. "
+        "Be concise, provide actionable steps, cite sources from the provided local docs or web results, and avoid hallucinations."
+    )
+    parts = [f"SYSTEM: {system_instructions}\n"]
+    if user_memory_text:
+        parts.append(f"USER_MEMORY:\n{user_memory_text}\n")
+    if retrieved:
+        parts.append("RETRIEVED_DOCS:")
+        for i, r in enumerate(retrieved, 1):
+            parts.append(f"\n--- Doc {i} ---\nTitle: {r.get('meta', {}).get('title')}\nSource: {r.get('meta', {}).get('source')}\nContent: {r.get('document')}\n")
+    if web_results:
+        parts.append("WEB_RESULTS:")
+        for i, w in enumerate(web_results, 1):
+            parts.append(f"\n[{i}] {w.get('url')} - {w.get('snippet')[:300]}\n")
+    if session_messages:
+        parts.append("\nCONVERSATION_HISTORY:")
+        for m in session_messages[-12:]:
+            parts.append(f"\n{m.get('role','').upper()}: {m.get('text')}")
+    parts.append(f"\nUSER: {payload.text}\n")
+    parts.append("\nASSISTANT: (Be concise, provide actionable steps, cite URLs where used.)\n")
+    prompt = "\n".join(parts)
+
+    try:
+        assistant_text = call_ollama_generate(prompt, timeout=60)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    assistant_msg = {"role": "assistant", "text": assistant_text, "ts": time.time()}
+    await sessions_col.update_one({"_id": session_id}, {"$push": {"messages": assistant_msg}})
+
+    return {"assistant": assistant_text, "session_id": session_id, "retrieved": retrieved, "web_results": web_results}
+
 @app.post("/docs", summary="Ingest a doc into Chroma DB")
 async def ingest_doc(payload: DocIn):
     doc_id = await add_doc(payload.title, payload.content, payload.source)
     return {"status": "ok", "doc_id": doc_id}
 
 @app.get("/alerts/scan", summary="Trigger health scan for region (on-demand)")
-async def alerts_scan(region: Optional[str] = "India", query: Optional[str] = None, k_docs: int = 4):
+async def alerts_scan(region: Optional[str] = "India", query: Optional[str] = None, k_docs: int = 4, allow_old: bool = False):
     try:
-        doc = await scan_region_for_alert(region=region, query=query, k_docs=k_docs)
+        doc = await scan_region_for_alert(region=region, query=query, k_docs=k_docs, allow_old=allow_old)
         # return richer payload: parsed alert, web findings, retrieved docs, raw llm output, and saved id
         return {
             "status": "ok",
@@ -558,6 +800,8 @@ async def alerts_scan(region: Optional[str] = "India", query: Optional[str] = No
             "web_results": doc.get("web_results"),
             "retrieved_docs": doc.get("retrieved_docs"),
             "llm_raw": doc.get("llm_raw"),
+            "filtered_out_count": doc.get("filtered_out_count", 0),
+            "note": f"By default pages older than {ALERT_MAX_AGE_DAYS} days are excluded unless allow_old=true."
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -571,6 +815,7 @@ async def get_latest_alert(region: Optional[str] = "India"):
 
 @app.get("/health")
 async def health():
+    api_keys_count = await api_keys_col.count_documents({})
     return {
         "status": "ok",
         "ollama": OLLAMA_URL,
@@ -578,6 +823,8 @@ async def health():
         "chroma": bool(collection),
         "session_context_max_tokens": SESSION_CONTEXT_MAX_TOKENS,
         "summarize_old_messages": SUMMARIZE_OLD_MESSAGES,
+        "alert_max_age_days": ALERT_MAX_AGE_DAYS,
+        "public_api_keys": api_keys_count,
     }
 
 # ---------- Run instructions ----------
